@@ -16,18 +16,22 @@ import (
 )
 
 var (
-	metricsPath string
+	metricsPath  string
+	workoutsPath string
 )
 
-// Backend LocalFile is used to store ingested metrics in the local filesystem
-// as JSON files. It is not very performant as it would process all data at once
-// to produce a sorted JSON output file. As such, it should only be used for
-// debugging purposes.
+// Backend LocalFile is used to store ingested metrics and workouts in the local
+// filesystem as JSON files. It is not very performant as it would process all
+// data at once to produce a sorted JSON output file. As such, it should only be
+// used for debugging purposes.
 //
-// TODO(irvinlim): Handle workout data
+// Metrics are written as one file per metric, merged by datapoint timestamp.
+// Workouts are written to a single file, merged by workout start time, and are
+// only handled when --localfile.workoutsPath is set.
 type Backend struct {
-	metrics map[string]*MetricFile
-	mtx     sync.RWMutex
+	metrics  map[string]*MetricFile
+	workouts *WorkoutFile
+	mtx      sync.RWMutex
 }
 
 var _ backends.Backend = &Backend{}
@@ -45,6 +49,15 @@ func NewBackend() (*Backend, error) {
 	}
 	backend.metrics = metrics
 
+	// Load workouts, if this backend is configured to handle them.
+	if workoutsPath != "" {
+		workouts, err := backend.loadWorkouts()
+		if err != nil {
+			return nil, errors.Wrapf(err, "cannot load workouts from %v", workoutsPath)
+		}
+		backend.workouts = workouts
+	}
+
 	return backend, nil
 }
 
@@ -52,8 +65,8 @@ func (b *Backend) Name() string {
 	return "LocalFile"
 }
 
-// Write will take the incoming payload and merge the metrics with existing
-// metric data, before writing it back to the filesystem.
+// Write will take the incoming payload and merge the metrics and workouts with
+// existing data, before writing it back to the filesystem.
 func (b *Backend) Write(payload *healthautoexport.Payload, target string) error {
 	b.mtx.Lock()
 	defer b.mtx.Unlock()
@@ -62,6 +75,18 @@ func (b *Backend) Write(payload *healthautoexport.Payload, target string) error 
 	for _, metric := range payload.Data.Metrics {
 		if err := b.handleMetric(metric, target); err != nil {
 			return errors.Wrapf(err, "handle metric error for %v", metric.Name)
+		}
+	}
+
+	// Handle workouts.
+	if len(payload.Data.Workouts) > 0 {
+		if workoutsPath == "" {
+			// Surface the misconfiguration rather than silently discarding data.
+			log.Warnf("discarding %d workout(s): --localfile.workoutsPath is not set",
+				len(payload.Data.Workouts))
+		} else if err := b.handleWorkouts(payload.Data.Workouts, target); err != nil {
+			return errors.Wrapf(err, "handle workouts error for %d workout(s)",
+				len(payload.Data.Workouts))
 		}
 	}
 
@@ -111,6 +136,66 @@ func (b *Backend) handleMetric(metric *healthautoexport.Metric, target string) e
 	return nil
 }
 
+// handleWorkouts merges the incoming workouts with the workouts already loaded
+// from disk, deduplicating by start time, then writes the merged set back out.
+//
+// Health Auto Export re-exports overlapping windows (for example an automation
+// reporting "Today"), so the same workout is normally received many times. Start
+// time is used as the identity because the exported workout payload carries no
+// stable id, and a re-export of the same workout is identical in name and start.
+func (b *Backend) handleWorkouts(workouts []*healthautoexport.Workout, target string) error {
+	if b.workouts == nil {
+		b.workouts = &WorkoutFile{}
+	}
+
+	byStart := make(map[string]*healthautoexport.Workout, len(b.workouts.Data))
+	for _, workout := range b.workouts.Data {
+		if key, ok := workoutKey(workout); ok {
+			byStart[key] = workout
+		}
+	}
+
+	skipped := 0
+	for _, workout := range workouts {
+		key, ok := workoutKey(workout)
+		if !ok {
+			skipped++
+			continue
+		}
+		byStart[key] = workout
+	}
+	if skipped > 0 {
+		log.Warnf("skipped %d workout(s) without a start time", skipped)
+	}
+
+	merged := make([]*healthautoexport.Workout, 0, len(byStart))
+	for _, workout := range byStart {
+		merged = append(merged, workout)
+	}
+	sort.Slice(merged, func(i, j int) bool {
+		return merged[i].Start.Before(merged[j].Start.Time)
+	})
+
+	b.workouts.Data = merged
+
+	workoutsFilePath := path.Join(workoutsPath, b.workouts.GetFileName())
+	if err := writeJSONFile(workoutsFilePath, b.workouts); err != nil {
+		return errors.Wrapf(err, "cannot write workouts to %v", workoutsFilePath)
+	}
+
+	return nil
+}
+
+// workoutKey returns a stable identity for a workout, which is its start time in
+// RFC3339. A workout without a start time cannot be identified across
+// re-exports, and is therefore not stored.
+func workoutKey(workout *healthautoexport.Workout) (string, bool) {
+	if workout == nil || workout.Start.IsZero() {
+		return "", false
+	}
+	return workout.Start.String(), true
+}
+
 func (b *Backend) loadMetrics() (map[string]*MetricFile, error) {
 	output := make(map[string]*MetricFile)
 	files, err := os.ReadDir(metricsPath)
@@ -154,6 +239,30 @@ func (b *Backend) loadMetricFile(name string) (*MetricFile, error) {
 	return &metricFile, nil
 }
 
+func (b *Backend) loadWorkouts() (*WorkoutFile, error) {
+	workoutsFilePath := path.Join(workoutsPath, WorkoutFile{}.GetFileName())
+
+	file, err := os.Open(workoutsFilePath)
+	if err != nil {
+		// File doesn't exist yet, simply return an empty file.
+		if os.IsNotExist(err) {
+			return &WorkoutFile{}, nil
+		}
+		return nil, errors.Wrapf(err, "cannot open %v", workoutsFilePath)
+	}
+	defer func() {
+		_ = file.Close()
+	}()
+
+	var workouts WorkoutFile
+	dec := jsoniter.NewDecoder(file)
+	if err := dec.Decode(&workouts); err != nil {
+		return nil, err
+	}
+
+	return &workouts, nil
+}
+
 func (b *Backend) writeMetricFile(name string, metricFile *MetricFile) error {
 	// Ensure directories exist
 	dirname := path.Dir(name)
@@ -176,8 +285,50 @@ func (b *Backend) writeMetricFile(name string, metricFile *MetricFile) error {
 	return enc.Encode(metricFile)
 }
 
+// writeJSONFile writes value to name as indented JSON, via a temporary file and
+// rename, so that a reader never observes a partially written file.
+func writeJSONFile(name string, value interface{}) error {
+	// Ensure directories exist
+	dirname := path.Dir(name)
+	if err := os.MkdirAll(dirname, 0755); err != nil {
+		return errors.Wrapf(err, "cannot makedirs for %v", dirname)
+	}
+
+	tmp, err := os.CreateTemp(dirname, "."+path.Base(name)+".tmp")
+	if err != nil {
+		return errors.Wrapf(err, "cannot create temp file in %v", dirname)
+	}
+	tmpName := tmp.Name()
+	defer func() {
+		// Best-effort cleanup; a successful rename has already moved the file.
+		_ = os.Remove(tmpName)
+	}()
+
+	enc := jsoniter.NewEncoder(tmp)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(value); err != nil {
+		_ = tmp.Close()
+		return errors.Wrapf(err, "cannot encode %v", name)
+	}
+	if err := tmp.Close(); err != nil {
+		return errors.Wrapf(err, "cannot close %v", tmpName)
+	}
+	if err := os.Chmod(tmpName, 0644); err != nil {
+		return errors.Wrapf(err, "cannot chmod %v", tmpName)
+	}
+	if err := os.Rename(tmpName, name); err != nil {
+		return errors.Wrapf(err, "cannot rename %v to %v", tmpName, name)
+	}
+
+	return nil
+}
+
 func init() {
 	pflag.StringVar(&metricsPath, "localfile.metricsPath", "",
 		"Output path to write metrics, with one metric per file. All data will be aggregated by timestamp. "+
 			"Any existing data will be merged together.")
+
+	pflag.StringVar(&workoutsPath, "localfile.workoutsPath", "",
+		"Output path to write workouts, as a single file merged by workout start time. "+
+			"Any existing data will be merged together. If unset, workouts are discarded.")
 }

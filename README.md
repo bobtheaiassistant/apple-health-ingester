@@ -85,6 +85,7 @@ Usage of ./build/ingester:
       --influxdb.staticTags strings          Additional tags to add to InfluxDB for every single request, in key=value format.
       --influxdb.workoutsBucketName string   InfluxDB bucket name for workouts.
       --localfile.metricsPath string         Output path to write metrics, with one metric per file. All data will be aggregated by timestamp. Any existing data will be merged together.
+      --localfile.workoutsPath string        Output path to write workouts, as a single file merged by workout start time. Any existing data will be merged together. If unset, workouts are discarded.
       --log string                           Log level to use. (default "info")
 ```
 
@@ -139,10 +140,12 @@ You must also configure additional fields for the backend to work. Example confi
 ```sh
 $ ingester \
   --backend.localfile \
-  --localfile.metricsPath=/data/health-export-metrics
+  --localfile.metricsPath=/data/health-export-metrics \
+  --localfile.workoutsPath=/data/health-export-workouts
 ```
 
-**NOTE**: Workout data is currently not yet supported for this storage backend.
+Metrics and workouts may share a single directory. If `--localfile.workoutsPath` is
+not set, workouts in the payload are discarded and a warning is logged.
 
 #### Example Output
 
@@ -163,6 +166,16 @@ drwxr-xr-x  3 irvin     96 Dec 25 00:11  ..
 ```
 
 If target name is specified during export, then the filename will be prefixed with the target name.
+
+Workouts are stored in a single `workouts.json`, merged by workout start time, so
+that a re-export of an overlapping window does not duplicate a workout:
+
+```sh
+$ ls -la /data/health-export-workouts
+-rw-r--r--  1 irvin 21456 Dec 25 00:19  workouts.json
+```
+
+Route, heart rate, elevation and any other exported workout fields are preserved.
 
 ### InfluxDB
 

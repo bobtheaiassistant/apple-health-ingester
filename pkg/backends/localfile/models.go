@@ -28,3 +28,14 @@ func (f *MetricFile) FromMetric(metric *healthautoexport.Metric, target string) 
 	f.Data = metric.Datapoints
 	f.Target = target
 }
+
+// WorkoutFile is the on-disk representation of ingested workouts. Unlike
+// metrics, which are stored as one file per metric name, every workout is kept
+// in this single file.
+type WorkoutFile struct {
+	Data []*healthautoexport.Workout `json:"data"`
+}
+
+func (f WorkoutFile) GetFileName() string {
+	return "workouts.json"
+}
