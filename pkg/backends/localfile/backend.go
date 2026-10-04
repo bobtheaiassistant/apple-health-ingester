@@ -1,6 +1,8 @@
 package localfile
 
 import (
+	"fmt"
+	"math/rand"
 	"os"
 	"path"
 	"sort"
@@ -294,9 +296,9 @@ func writeJSONFile(name string, value interface{}) error {
 		return errors.Wrapf(err, "cannot makedirs for %v", dirname)
 	}
 
-	tmp, err := os.CreateTemp(dirname, "."+path.Base(name)+".tmp")
+	tmp, err := openTempFile(dirname, path.Base(name))
 	if err != nil {
-		return errors.Wrapf(err, "cannot create temp file in %v", dirname)
+		return err
 	}
 	tmpName := tmp.Name()
 	defer func() {
@@ -313,14 +315,36 @@ func writeJSONFile(name string, value interface{}) error {
 	if err := tmp.Close(); err != nil {
 		return errors.Wrapf(err, "cannot close %v", tmpName)
 	}
-	if err := os.Chmod(tmpName, 0644); err != nil {
-		return errors.Wrapf(err, "cannot chmod %v", tmpName)
-	}
 	if err := os.Rename(tmpName, name); err != nil {
 		return errors.Wrapf(err, "cannot rename %v to %v", tmpName, name)
 	}
 
 	return nil
+}
+
+// openTempFile creates a new unique temporary file alongside name.
+//
+// It deliberately does not use os.CreateTemp: that helper creates the file
+// with a fixed mode of 0600, which is unaffected by the process umask, and the
+// caller previously had to chmod the result to 0644 explicitly. That produced
+// files with a wider mode than every other file this backend writes.
+//
+// Opening with a 0644 create mode instead lets the process umask apply, so
+// workouts.json matches the metrics files (0640 under the service's UMask of
+// 0027). O_EXCL guarantees a fresh file, so a stale leftover can never be reused
+// or truncated in place.
+func openTempFile(dirname, base string) (*os.File, error) {
+	for attempt := 0; attempt < 100; attempt++ {
+		tmpName := path.Join(dirname, fmt.Sprintf(".%s.tmp.%d", base, rand.Int63()))
+		file, err := os.OpenFile(tmpName, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
+		if err == nil {
+			return file, nil
+		}
+		if !os.IsExist(err) {
+			return nil, errors.Wrapf(err, "cannot create temp file in %v", dirname)
+		}
+	}
+	return nil, errors.Errorf("cannot create temp file in %v: exhausted unique names", dirname)
 }
 
 func init() {

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path"
+	"syscall"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -166,4 +167,32 @@ func TestWriteMetricsStillWorkAlongsideWorkouts(t *testing.T) {
 	metricRaw, err := os.ReadFile(path.Join(dir, "active_energy_kJ.json"))
 	require.NoError(t, err)
 	assert.Contains(t, string(metricRaw), "active_energy")
+}
+
+// TestWriteWorkoutsRespectsUmask guards the file mode of workouts.json. The
+// service runs with UMask=0027, so every file it writes must land as 0640. The
+// workouts writer used to create its temp file with os.CreateTemp (mode 0600)
+// and then chmod it to 0644, which bypassed the umask and produced a wider mode
+// than the metrics files.
+func TestWriteWorkoutsRespectsUmask(t *testing.T) {
+	// syscall.Umask is process-wide, so restore it before returning.
+	previous := syscall.Umask(0027)
+	defer syscall.Umask(previous)
+
+	dir := setupBackendPaths(t, true)
+
+	backend, err := NewBackend()
+	require.NoError(t, err)
+
+	require.NoError(t, backend.Write(fixtures.PayloadWithWorkouts, ""))
+
+	info, err := os.Stat(path.Join(dir, "workouts.json"))
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0640), info.Mode().Perm(),
+		"workouts.json must honour UMask=0027 and be 0640")
+
+	// The file must still be valid JSON containing the ingested workout.
+	file := readWorkoutFile(t, dir)
+	require.Len(t, file.Data, 1)
+	assert.Equal(t, "Walking", file.Data[0].Name)
 }
