@@ -46,6 +46,18 @@ func readWorkoutFile(t *testing.T, dir string) WorkoutFile {
 	return file
 }
 
+func readMetricFile(t *testing.T, dir, name string) MetricFile {
+	t.Helper()
+
+	raw, err := os.ReadFile(path.Join(dir, name))
+	require.NoError(t, err)
+
+	var file MetricFile
+	require.NoError(t, json.Unmarshal(raw, &file))
+
+	return file
+}
+
 func mkworkout(t *testing.T, name, start, end string) *healthautoexport.Workout {
 	t.Helper()
 
@@ -167,6 +179,31 @@ func TestWriteMetricsStillWorkAlongsideWorkouts(t *testing.T) {
 	metricRaw, err := os.ReadFile(path.Join(dir, "active_energy_kJ.json"))
 	require.NoError(t, err)
 	assert.Contains(t, string(metricRaw), "active_energy")
+}
+
+func TestWriteMetricsMergesAcrossRequestsWithoutRestart(t *testing.T) {
+	dir := setupBackendPaths(t, false)
+
+	backend, err := NewBackend()
+	require.NoError(t, err)
+
+	// Health Auto Export can send a non-empty daily request followed by an
+	// empty request for the same metric. The latter must not erase data that
+	// the running backend accepted earlier.
+	require.NoError(t, backend.Write(fixtures.PayloadWithMetrics, ""))
+	require.NoError(t, backend.Write(&healthautoexport.Payload{
+		Data: &healthautoexport.PayloadData{
+			Metrics: []*healthautoexport.Metric{
+				fixtures.MetricBasalBodyTemperatureNoData,
+				{
+					Name:  "active_energy",
+					Units: "kJ",
+				},
+			},
+		},
+	}, ""))
+
+	assert.Len(t, readMetricFile(t, dir, "active_energy_kJ.json").Data, 2)
 }
 
 // TestWriteWorkoutsRespectsUmask guards the file mode of workouts.json. The

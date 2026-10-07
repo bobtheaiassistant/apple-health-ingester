@@ -135,6 +135,10 @@ func (b *Backend) handleMetric(metric *healthautoexport.Metric, target string) e
 		return errors.Wrapf(err, "cannot write metrics to %v", metricFilePath)
 	}
 
+	// Keep the in-memory state in sync so later requests merge with every
+	// datapoint accepted since startup, not only with the startup snapshot.
+	b.metrics[fileName] = &metricFile
+
 	return nil
 }
 
