@@ -206,6 +206,131 @@ func TestWriteMetricsMergesAcrossRequestsWithoutRestart(t *testing.T) {
 	assert.Len(t, readMetricFile(t, dir, "active_energy_kJ.json").Data, 2)
 }
 
+func TestWriteAggregatedSleepPersistsAcrossEmptyRequest(t *testing.T) {
+	dir := setupBackendPaths(t, false)
+
+	backend, err := NewBackend()
+	require.NoError(t, err)
+
+	var payload healthautoexport.Payload
+	require.NoError(t, json.Unmarshal([]byte(`{
+		"data":{"metrics":[{"name":"sleep_analysis","units":"hr","data":[{
+			"date":"2026-10-07 00:00:00 +0300",
+			"sleepStart":"2026-10-07 00:43:01 +0300",
+			"sleepEnd":"2026-10-07 08:00:21 +0300",
+			"totalSleep":7.2058835822343834,
+			"deep":1.2038017341825697,
+			"rem":1.6187864506906935,
+			"core":4.3832953973611204,
+			"awake":0.083015705545743293,
+			"source":"Daniel’s Apple Watch"
+		}]}]}
+	}`), &payload))
+	require.NoError(t, backend.Write(&payload, ""))
+	require.NoError(t, backend.Write(&healthautoexport.Payload{
+		Data: &healthautoexport.PayloadData{Metrics: []*healthautoexport.Metric{{
+			Name: "sleep_analysis", Units: "hr",
+		}}},
+	}, ""))
+
+	raw, err := os.ReadFile(path.Join(dir, "sleep_analysis_hr.json"))
+	require.NoError(t, err)
+	var saved struct {
+		Data []map[string]interface{} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(raw, &saved))
+	require.Len(t, saved.Data, 1)
+	assert.Equal(t, "2026-10-07 00:00:00 +0300", saved.Data[0]["date"])
+	assert.Equal(t, 7.2058835822343834, saved.Data[0]["totalSleep"])
+}
+
+func TestWriteAggregatedSleepMergesAcrossRestartAndDateFallback(t *testing.T) {
+	dir := setupBackendPaths(t, false)
+
+	var first healthautoexport.Payload
+	require.NoError(t, json.Unmarshal([]byte(`{"data":{"metrics":[{
+		"name":"sleep_analysis","units":"hr","data":[{
+			"sleepStart":"2026-10-06 23:30:00 +0300",
+			"sleepEnd":"2026-10-07 07:00:00 +0300",
+			"totalSleep":6.5
+		}]}]}}`), &first))
+	backend, err := NewBackend()
+	require.NoError(t, err)
+	require.NoError(t, backend.Write(&first, ""))
+
+	// The same night later arrives with its canonical date and corrected total,
+	// followed by a different night after a simulated process restart.
+	var update healthautoexport.Payload
+	require.NoError(t, json.Unmarshal([]byte(`{"data":{"metrics":[{
+		"name":"sleep_analysis","units":"hr","data":[
+			{"date":"2026-10-07 00:00:00 +0300","sleepStart":"2026-10-06 23:30:00 +0300","sleepEnd":"2026-10-07 07:00:00 +0300","totalSleep":7.0},
+			{"date":"2026-10-08 00:00:00 +0300","sleepStart":"2026-10-08 00:30:00 +0300","sleepEnd":"2026-10-08 08:00:00 +0300","totalSleep":7.5}
+		]}]}}`), &update))
+	reloaded, err := NewBackend()
+	require.NoError(t, err)
+	require.NoError(t, reloaded.Write(&update, ""))
+
+	raw, err := os.ReadFile(path.Join(dir, "sleep_analysis_hr.json"))
+	require.NoError(t, err)
+	var saved AggregatedSleepMetricFile
+	require.NoError(t, json.Unmarshal(raw, &saved))
+	require.Len(t, saved.Data, 2)
+	assert.Equal(t, healthautoexport.Qty(7.0), saved.Data[0].TotalSleep)
+	assert.Equal(t, "2026-10-08T00:00:00+03:00", saved.Data[1].Date.String())
+}
+
+func TestWriteNonAggregatedSleepIsPreserved(t *testing.T) {
+	dir := setupBackendPaths(t, false)
+
+	var payload healthautoexport.Payload
+	require.NoError(t, json.Unmarshal([]byte(`{"data":{"metrics":[{
+		"name":"sleep_analysis","units":"hr","data":[{
+			"startDate":"2026-10-07 00:43:01 +0300",
+			"endDate":"2026-10-07 01:15:00 +0300",
+			"value":"Core","source":"Daniel’s Apple Watch"
+		}]}]}}`), &payload))
+	backend, err := NewBackend()
+	require.NoError(t, err)
+	require.NoError(t, backend.Write(&payload, ""))
+
+	raw, err := os.ReadFile(path.Join(dir, "sleep_analysis_hr.json"))
+	require.NoError(t, err)
+	var saved SleepAnalysisMetricFile
+	require.NoError(t, json.Unmarshal(raw, &saved))
+	require.Len(t, saved.Data, 1)
+	assert.Equal(t, "Core", saved.Data[0].Value)
+}
+
+func TestWriteAggregatedSleepSortsEntryWithOnlySleepEnd(t *testing.T) {
+	dir := setupBackendPaths(t, false)
+
+	validStart, err := healthautoexport.ParseTime("2026-10-07 00:30:00 +0300")
+	require.NoError(t, err)
+	validEnd, err := healthautoexport.ParseTime("2026-10-07 07:00:00 +0300")
+	require.NoError(t, err)
+	endOnly, err := healthautoexport.ParseTime("2026-10-08 07:00:00 +0300")
+	require.NoError(t, err)
+	payload := &healthautoexport.Payload{Data: &healthautoexport.PayloadData{
+		Metrics: []*healthautoexport.Metric{{
+			Name: "sleep_analysis", Units: "hr",
+			AggregatedSleepAnalyses: []*healthautoexport.AggregatedSleepAnalysis{
+				{SleepStart: &validStart, SleepEnd: &validEnd},
+				{SleepEnd: &endOnly},
+			},
+		}},
+	}}
+
+	backend, err := NewBackend()
+	require.NoError(t, err)
+	require.NotPanics(t, func() { require.NoError(t, backend.Write(payload, "")) })
+
+	raw, err := os.ReadFile(path.Join(dir, "sleep_analysis_hr.json"))
+	require.NoError(t, err)
+	var saved AggregatedSleepMetricFile
+	require.NoError(t, json.Unmarshal(raw, &saved))
+	assert.Len(t, saved.Data, 2)
+}
+
 // TestWriteWorkoutsRespectsUmask guards the file mode of workouts.json. The
 // service runs with UMask=0027, so every file it writes must land as 0640. The
 // workouts writer used to create its temp file with os.CreateTemp (mode 0600)

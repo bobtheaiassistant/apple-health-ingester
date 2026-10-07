@@ -75,7 +75,21 @@ func (b *Backend) Write(payload *healthautoexport.Payload, target string) error 
 
 	// Handle metrics.
 	for _, metric := range payload.Data.Metrics {
-		if err := b.handleMetric(metric, target); err != nil {
+		var err error
+		switch {
+		case len(metric.AggregatedSleepAnalyses) > 0:
+			err = b.handleAggregatedSleepMetric(metric, target)
+		case len(metric.SleepAnalyses) > 0:
+			err = b.handleSleepMetric(metric, target)
+		case len(metric.Datapoints) > 0 || metric.Name != healthautoexport.SleepAnalysisName:
+			err = b.handleMetric(metric, target)
+		default:
+			// An empty sleep payload does not reveal whether the exporter uses
+			// aggregated or interval sleep. It carries nothing to merge, so leave
+			// the existing file untouched rather than guessing and erasing it.
+			continue
+		}
+		if err != nil {
 			return errors.Wrapf(err, "handle metric error for %v", metric.Name)
 		}
 	}
@@ -140,6 +154,135 @@ func (b *Backend) handleMetric(metric *healthautoexport.Metric, target string) e
 	b.metrics[fileName] = &metricFile
 
 	return nil
+}
+
+func (b *Backend) handleSleepMetric(metric *healthautoexport.Metric, target string) error {
+	fileName := MetricFile{Name: metric.Name, Units: metric.Units, Target: target}.GetFileName()
+	metricFilePath := path.Join(metricsPath, fileName)
+	stored := &SleepAnalysisMetricFile{Name: metric.Name, Units: metric.Units, Target: target}
+
+	if raw, err := os.ReadFile(metricFilePath); err == nil {
+		if err := jsoniter.Unmarshal(raw, stored); err != nil {
+			return errors.Wrapf(err, "cannot parse existing sleep metrics from %v", metricFilePath)
+		}
+	} else if !os.IsNotExist(err) {
+		return errors.Wrapf(err, "cannot read existing sleep metrics from %v", metricFilePath)
+	}
+
+	byInterval := make(map[string]*healthautoexport.SleepAnalysis,
+		len(stored.Data)+len(metric.SleepAnalyses))
+	invalidExisting := 0
+	for _, analysis := range stored.Data {
+		if key, ok := sleepAnalysisKey(analysis); ok {
+			byInterval[key] = analysis
+		} else {
+			invalidExisting++
+		}
+	}
+	if invalidExisting > 0 {
+		return errors.Errorf("existing %v contains a different sleep representation", metricFilePath)
+	}
+	for _, analysis := range metric.SleepAnalyses {
+		if key, ok := sleepAnalysisKey(analysis); ok {
+			byInterval[key] = analysis
+		}
+	}
+
+	stored.Data = stored.Data[:0]
+	for _, analysis := range byInterval {
+		stored.Data = append(stored.Data, analysis)
+	}
+	sort.Slice(stored.Data, func(i, j int) bool {
+		return stored.Data[i].StartDate.Before(stored.Data[j].StartDate.Time)
+	})
+	if err := writeJSONFile(metricFilePath, stored); err != nil {
+		return errors.Wrapf(err, "cannot write sleep metrics to %v", metricFilePath)
+	}
+	return nil
+}
+
+func sleepAnalysisKey(analysis *healthautoexport.SleepAnalysis) (string, bool) {
+	if analysis == nil || analysis.StartDate == nil || analysis.StartDate.IsZero() ||
+		analysis.EndDate == nil || analysis.EndDate.IsZero() {
+		return "", false
+	}
+	return analysis.StartDate.String() + "/" + analysis.EndDate.String(), true
+}
+
+func (b *Backend) handleAggregatedSleepMetric(metric *healthautoexport.Metric, target string) error {
+	fileName := MetricFile{Name: metric.Name, Units: metric.Units, Target: target}.GetFileName()
+	metricFilePath := path.Join(metricsPath, fileName)
+	stored := &AggregatedSleepMetricFile{
+		Name: metric.Name, Units: metric.Units, Target: target,
+	}
+
+	if raw, err := os.ReadFile(metricFilePath); err == nil {
+		if err := jsoniter.Unmarshal(raw, stored); err != nil {
+			return errors.Wrapf(err, "cannot parse existing aggregated sleep metrics from %v", metricFilePath)
+		}
+	} else if !os.IsNotExist(err) {
+		return errors.Wrapf(err, "cannot read existing aggregated sleep metrics from %v", metricFilePath)
+	}
+
+	byDate := make(map[string]*healthautoexport.AggregatedSleepAnalysis,
+		len(stored.Data)+len(metric.AggregatedSleepAnalyses))
+	invalidExisting := 0
+	for _, analysis := range stored.Data {
+		if key, ok := aggregatedSleepKey(analysis); ok {
+			byDate[key] = analysis
+		} else {
+			invalidExisting++
+		}
+	}
+	if invalidExisting > 0 {
+		return errors.Errorf("existing %v contains a different sleep representation", metricFilePath)
+	}
+	for _, analysis := range metric.AggregatedSleepAnalyses {
+		if key, ok := aggregatedSleepKey(analysis); ok {
+			byDate[key] = analysis
+		}
+	}
+
+	stored.Data = stored.Data[:0]
+	for _, analysis := range byDate {
+		stored.Data = append(stored.Data, analysis)
+	}
+	sort.Slice(stored.Data, func(i, j int) bool {
+		return aggregatedSleepSortTime(stored.Data[i]).Before(aggregatedSleepSortTime(stored.Data[j]).Time)
+	})
+
+	if err := writeJSONFile(metricFilePath, stored); err != nil {
+		return errors.Wrapf(err, "cannot write aggregated sleep metrics to %v", metricFilePath)
+	}
+	return nil
+}
+
+func aggregatedSleepKey(analysis *healthautoexport.AggregatedSleepAnalysis) (string, bool) {
+	if analysis == nil {
+		return "", false
+	}
+	if analysis.Date != nil && !analysis.Date.IsZero() {
+		return analysis.Date.Time.Format("2006-01-02"), true
+	}
+	// The aggregate's date is its wake-up day, so SleepEnd is the closest
+	// canonical fallback when older payloads omit Date.
+	if analysis.SleepEnd != nil && !analysis.SleepEnd.IsZero() {
+		return analysis.SleepEnd.Time.Format("2006-01-02"), true
+	}
+	if analysis.SleepStart != nil && !analysis.SleepStart.IsZero() {
+		return analysis.SleepStart.Time.Format("2006-01-02"), true
+	}
+	return "", false
+}
+
+func aggregatedSleepSortTime(analysis *healthautoexport.AggregatedSleepAnalysis) *healthautoexport.Time {
+	if analysis != nil && analysis.Date != nil && !analysis.Date.IsZero() {
+		return analysis.Date
+	}
+	if analysis != nil && analysis.SleepEnd != nil && !analysis.SleepEnd.IsZero() {
+		return analysis.SleepEnd
+	}
+	return analysis.SleepStart
 }
 
 // handleWorkouts merges the incoming workouts with the workouts already loaded

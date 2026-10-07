@@ -83,7 +83,11 @@ type SleepAnalysis struct {
 // AggregatedSleepAnalysis defines an aggregated period of an entire night of sleep.
 // It is only valid for aggregate sleep analysis data ("Aggregate Sleep Data" is enabled)
 type AggregatedSleepAnalysis struct {
-	// we don't parse "date" which doesn't seem to have useful interesting information
+	// Calendar date assigned to the aggregate by Health Auto Export.
+	Date *Time `json:"date,omitempty"`
+
+	// Total sleep duration in hours.
+	TotalSleep Qty `json:"totalSleep,omitempty"`
 
 	// Start time of sleep.
 	SleepStart *Time `json:"sleepStart"`

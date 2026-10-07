@@ -46,6 +46,7 @@ var (
 					Units: "hr",
 					AggregatedSleepAnalyses: []*healthautoexport.AggregatedSleepAnalysis{
 						{
+							Date:        mktime("2021-12-18 09:03:36 +0800"),
 							Asleep:      6.108333333333333,
 							SleepStart:  mktime("2021-12-18 02:21:06 +0800"),
 							SleepEnd:    mktime("2021-12-18 08:57:06 +0800"),
@@ -140,6 +141,7 @@ var (
 					Units: "hr",
 					AggregatedSleepAnalyses: []*healthautoexport.AggregatedSleepAnalysis{
 						{
+							Date:       mktime("2023-01-31 02:44:02 +0800"),
 							Asleep:     0,
 							SleepStart: mktime("2023-01-31 00:23:47 +0800"),
 							SleepEnd:   mktime("2023-01-31 08:39:12 +0800"),

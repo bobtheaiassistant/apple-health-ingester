@@ -13,6 +13,23 @@ type MetricFile struct {
 	Data   []*healthautoexport.Datapoint `json:"data"`
 }
 
+// AggregatedSleepMetricFile preserves the richer nightly sleep summaries that
+// cannot be represented as ordinary quantity datapoints.
+type AggregatedSleepMetricFile struct {
+	Name   string                                      `json:"name"`
+	Target string                                      `json:"target,omitempty"`
+	Units  healthautoexport.Units                      `json:"units"`
+	Data   []*healthautoexport.AggregatedSleepAnalysis `json:"data"`
+}
+
+// SleepAnalysisMetricFile stores non-aggregated sleep-stage intervals.
+type SleepAnalysisMetricFile struct {
+	Name   string                            `json:"name"`
+	Target string                            `json:"target,omitempty"`
+	Units  healthautoexport.Units            `json:"units"`
+	Data   []*healthautoexport.SleepAnalysis `json:"data"`
+}
+
 func (f MetricFile) GetFileName() string {
 	filename := f.Name + "_" + string(f.Units)
 	filename = strings.ReplaceAll(filename, "/", "_")
